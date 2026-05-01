@@ -23,6 +23,7 @@ import {
 } from "@/models";
 import { initializeObservabilityMetrics } from "@/observability";
 import {
+  AgentLabelWithDetailsSchema,
   type AgentScope,
   AgentScopeFilterSchema,
   ApiError,
@@ -31,10 +32,44 @@ import {
   createSortingQuerySchema,
   DeleteObjectResponseSchema,
   InsertAgentSchema,
+  PassthroughHeadersSchema,
   SelectAgentSchema,
+  SuggestedPromptInputSchema,
   UpdateAgentSchemaBase,
   UuidIdSchema,
 } from "@/types";
+
+const PortableAgentConfigSchema = z.object({
+  schemaVersion: z.literal(1).default(1),
+  exportedAt: z.string().optional(),
+  agent: z.object({
+    agentType: z.literal("agent").default("agent"),
+    name: z.string().min(1),
+    description: z.string().nullable().optional(),
+    icon: z.string().nullable().optional(),
+    systemPrompt: z.string().nullable().optional(),
+    considerContextUntrusted: z.boolean().optional(),
+    incomingEmailEnabled: z.boolean().optional(),
+    incomingEmailSecurityMode: z
+      .enum(["private", "internal", "public"])
+      .optional(),
+    incomingEmailAllowedDomain: z.string().nullable().optional(),
+    llmModel: z.string().nullable().optional(),
+    toolExposureMode: z.enum(["full", "search_and_run_only"]).optional(),
+    toolAssignmentMode: z.enum(["automatic", "manual"]).optional(),
+    passthroughHeaders: PassthroughHeadersSchema,
+    labels: z
+      .array(AgentLabelWithDetailsSchema.pick({ key: true, value: true }))
+      .default([]),
+    suggestedPrompts: z.array(SuggestedPromptInputSchema).default([]),
+    tools: z.array(z.object({ name: z.string() })).default([]),
+    knowledgeBases: z.array(z.object({ name: z.string() })).default([]),
+  }),
+});
+
+const ImportAgentResponseSchema = SelectAgentSchema.extend({
+  importWarnings: z.array(z.string()),
+});
 
 const agentRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.get(
@@ -491,6 +526,190 @@ const agentRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       return reply.send(agent);
+    },
+  );
+
+  fastify.get(
+    "/api/agents/:id/export",
+    {
+      schema: {
+        operationId: RouteId.ExportAgent,
+        description: "Export an agent configuration as portable JSON",
+        tags: ["Agents"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(PortableAgentConfigSchema),
+      },
+    },
+    async ({ params: { id }, user, organizationId }, reply) => {
+      const agent = await AgentModel.findById(id, user.id, true);
+
+      if (!agent) {
+        throw new ApiError(404, "Agent not found");
+      }
+
+      const checker = await getAgentTypePermissionChecker({
+        userId: user.id,
+        organizationId,
+      });
+
+      if (agent.agentType !== "agent") {
+        throw new ApiError(400, "Only agents can be exported");
+      }
+
+      try {
+        checker.require(agent.agentType, "update");
+      } catch {
+        throw new ApiError(404, "Agent not found");
+      }
+
+      const userTeamIds = !checker.isAdmin(agent.agentType)
+        ? await TeamModel.getUserTeamIds(user.id)
+        : [];
+
+      requireAgentModifyPermission({
+        checker,
+        agentType: agent.agentType,
+        agentScope: agent.scope,
+        agentAuthorId: agent.authorId,
+        agentTeamIds: agent.teams.map((t) => t.id),
+        userTeamIds,
+        userId: user.id,
+      });
+
+      const knowledgeBases = agent.knowledgeBaseIds.length
+        ? await KnowledgeBaseModel.findByIds(agent.knowledgeBaseIds)
+        : [];
+
+      return reply.send({
+        schemaVersion: 1,
+        exportedAt: new Date().toISOString(),
+        agent: {
+          agentType: agent.agentType,
+          name: agent.name,
+          description: agent.description,
+          icon: agent.icon,
+          systemPrompt: agent.systemPrompt,
+          considerContextUntrusted: agent.considerContextUntrusted,
+          incomingEmailEnabled: agent.incomingEmailEnabled,
+          incomingEmailSecurityMode: agent.incomingEmailSecurityMode,
+          incomingEmailAllowedDomain: agent.incomingEmailAllowedDomain,
+          llmModel: agent.llmModel,
+          toolExposureMode: agent.toolExposureMode,
+          toolAssignmentMode: agent.toolAssignmentMode,
+          passthroughHeaders: agent.passthroughHeaders,
+          labels: agent.labels.map(({ key, value }) => ({ key, value })),
+          suggestedPrompts: agent.suggestedPrompts,
+          tools: agent.tools.map(({ name }) => ({ name })),
+          knowledgeBases: knowledgeBases.map(({ name }) => ({ name })),
+        },
+      });
+    },
+  );
+
+  fastify.post(
+    "/api/agents/import",
+    {
+      schema: {
+        operationId: RouteId.ImportAgent,
+        description: "Import a portable agent configuration",
+        tags: ["Agents"],
+        body: PortableAgentConfigSchema,
+        response: constructResponseSchema(ImportAgentResponseSchema),
+      },
+    },
+    async ({ body, user, organizationId }, reply) => {
+      const { agent: portableAgent } = body;
+      const checker = await getAgentTypePermissionChecker({
+        userId: user.id,
+        organizationId,
+      });
+      checker.require("agent", "create");
+
+      const knowledgeBases = portableAgent.knowledgeBases.length
+        ? await KnowledgeBaseModel.findByOrganization({ organizationId })
+        : [];
+      const knowledgeBasesByName = new Map<string, typeof knowledgeBases>();
+      for (const kb of knowledgeBases) {
+        knowledgeBasesByName.set(kb.name, [
+          ...(knowledgeBasesByName.get(kb.name) ?? []),
+          kb,
+        ]);
+      }
+      const knowledgeBaseIds: string[] = [];
+      const importWarnings: string[] = [];
+
+      for (const kb of portableAgent.knowledgeBases) {
+        const matches = knowledgeBasesByName.get(kb.name) ?? [];
+        if (matches.length === 1) {
+          knowledgeBaseIds.push(matches[0].id);
+        } else if (matches.length > 1) {
+          importWarnings.push(
+            `Knowledge base name is ambiguous locally and was skipped: ${kb.name}`,
+          );
+        } else {
+          importWarnings.push(`Knowledge base not found locally: ${kb.name}`);
+        }
+      }
+
+      if (knowledgeBaseIds.length > 0) {
+        const knowledgeSourceAccess =
+          await knowledgeSourceAccessControlService.buildAccessControlContext({
+            userId: user.id,
+            organizationId,
+          });
+        for (const kbId of knowledgeBaseIds) {
+          await validateKnowledgeBaseAccess({
+            kbId,
+            organizationId,
+            access: knowledgeSourceAccess,
+          });
+        }
+      }
+
+      if (portableAgent.tools.length > 0) {
+        importWarnings.push(
+          "Tool assignments were not imported. Re-assign tools after import so normal tool visibility and permission checks apply.",
+        );
+      }
+
+      const createData = InsertAgentSchema.parse({
+        agentType: "agent",
+        name: portableAgent.name,
+        description: portableAgent.description,
+        icon: portableAgent.icon,
+        systemPrompt: portableAgent.systemPrompt,
+        considerContextUntrusted: portableAgent.considerContextUntrusted,
+        incomingEmailEnabled: portableAgent.incomingEmailEnabled,
+        incomingEmailSecurityMode: portableAgent.incomingEmailSecurityMode,
+        incomingEmailAllowedDomain: portableAgent.incomingEmailAllowedDomain,
+        llmModel: portableAgent.llmModel,
+        toolExposureMode: portableAgent.toolExposureMode,
+        toolAssignmentMode: "manual",
+        passthroughHeaders: portableAgent.passthroughHeaders,
+        scope: "personal",
+        organizationId,
+        teams: [],
+        labels: portableAgent.labels,
+        knowledgeBaseIds,
+        connectorIds: [],
+        suggestedPrompts: portableAgent.suggestedPrompts,
+      });
+
+      const createdAgent = await AgentModel.create(createData, user.id);
+      // Keep observability label metrics in sync with normal agent creation.
+      await initializeObservabilityMetrics();
+
+      const importedAgent = await AgentModel.findById(
+        createdAgent.id,
+        user.id,
+        true,
+      );
+      return reply.send({
+        ...(importedAgent ?? createdAgent),
+        importWarnings,
+      });
     },
   );
 

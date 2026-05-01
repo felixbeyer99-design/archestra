@@ -1,5 +1,14 @@
-import { E2eTestId } from "@shared";
-import { Clock, Eye, MessageSquare, Pencil, Plug, Trash2 } from "lucide-react";
+import { archestraApiSdk, E2eTestId } from "@shared";
+import {
+  Clock,
+  Download,
+  Eye,
+  MessageSquare,
+  Pencil,
+  Plug,
+  Trash2,
+} from "lucide-react";
+import { toast } from "sonner";
 import {
   type TableRowAction,
   TableRowActions,
@@ -28,6 +37,37 @@ export function AgentActions({
   onDelete,
 }: AgentActionsProps) {
   const isBuiltIn = Boolean(agent.builtIn);
+
+  const handleExport = async () => {
+    try {
+      const { data: exportedAgent, error } = await archestraApiSdk.exportAgent({
+        path: { id: agent.id },
+      });
+      if (error || !exportedAgent) {
+        throw new Error(error?.error?.message ?? "Failed to export agent");
+      }
+      const blob = new Blob([JSON.stringify(exportedAgent, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const safeName = agent.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+      link.href = url;
+      link.download = `${safeName || "agent"}-export.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast.success("Agent exported");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to export agent",
+      );
+    }
+  };
 
   const editOrViewAction: TableRowAction =
     canModify || isBuiltIn
@@ -71,6 +111,11 @@ export function AgentActions({
       href: `/scheduled-tasks?agentId=${agent.id}`,
     },
     editOrViewAction,
+    {
+      icon: <Download className="h-4 w-4" />,
+      label: "Export",
+      onClick: handleExport,
+    },
     {
       icon: <Trash2 className="h-4 w-4" />,
       label: "Delete",
