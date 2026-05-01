@@ -152,6 +152,108 @@ describe("agent routes", () => {
     });
   });
 
+  describe("agent import/export", () => {
+    test("exports a portable agent config without internal IDs", async ({
+      makeAgent,
+      makeAgentTool,
+      makeKnowledgeBase,
+      makeTool,
+    }) => {
+      const kb = await makeKnowledgeBase(organizationId, {
+        name: `Export KB ${crypto.randomUUID().slice(0, 8)}`,
+      });
+      const agent = await makeAgent({
+        name: `Export Agent ${crypto.randomUUID().slice(0, 8)}`,
+        organizationId,
+        authorId: user.id,
+        agentType: "agent",
+        scope: "personal",
+        systemPrompt: "Keep the config portable",
+        passthroughHeaders: ["x-trace-id"],
+        labels: [{ key: "team", value: "platform" }],
+        knowledgeBaseIds: [kb.id],
+        suggestedPrompts: [
+          { summaryTitle: "Start", prompt: "Summarize the workspace" },
+        ],
+      });
+      const tool = await makeTool({ name: `export-tool-${agent.id}` });
+      await makeAgentTool(agent.id, tool.id);
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/agents/${agent.id}/export`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const exportedConfig = response.json();
+      expect(exportedConfig.schemaVersion).toBe(1);
+      expect(exportedConfig.agent.name).toBe(agent.name);
+      expect(exportedConfig.agent.systemPrompt).toBe(
+        "Keep the config portable",
+      );
+      expect(exportedConfig.agent.passthroughHeaders).toEqual(["x-trace-id"]);
+      expect(exportedConfig.agent.labels).toEqual([
+        { key: "team", value: "platform" },
+      ]);
+      expect(exportedConfig.agent.suggestedPrompts).toEqual([
+        { summaryTitle: "Start", prompt: "Summarize the workspace" },
+      ]);
+      expect(exportedConfig.agent.tools).toEqual([{ name: tool.name }]);
+      expect(exportedConfig.agent.knowledgeBases).toEqual([{ name: kb.name }]);
+      expect(exportedConfig.agent).not.toHaveProperty("id");
+      expect(exportedConfig.agent).not.toHaveProperty("authorId");
+      expect(exportedConfig.agent).not.toHaveProperty("organizationId");
+    });
+
+    test("imports a personal agent and does not auto-assign tools", async ({
+      makeKnowledgeBase,
+    }) => {
+      const kb = await makeKnowledgeBase(organizationId, {
+        name: `Import KB ${crypto.randomUUID().slice(0, 8)}`,
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/agents/import",
+        payload: {
+          schemaVersion: 1,
+          agent: {
+            agentType: "agent",
+            name: `Imported Agent ${crypto.randomUUID().slice(0, 8)}`,
+            description: "Imported safely",
+            systemPrompt: "Imported prompt",
+            passthroughHeaders: ["X-Trace-Id"],
+            labels: [{ key: "source", value: "import" }],
+            suggestedPrompts: [
+              { summaryTitle: "Imported", prompt: "Use the imported prompt" },
+            ],
+            tools: [{ name: "local-tool-name" }],
+            knowledgeBases: [{ name: kb.name }],
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const importedAgent = response.json();
+      expect(importedAgent.scope).toBe("personal");
+      expect(importedAgent.agentType).toBe("agent");
+      expect(importedAgent.systemPrompt).toBe("Imported prompt");
+      expect(importedAgent.toolAssignmentMode).toBe("manual");
+      expect(importedAgent.passthroughHeaders).toEqual(["x-trace-id"]);
+      expect(importedAgent.labels).toMatchObject([
+        { key: "source", value: "import" },
+      ]);
+      expect(importedAgent.suggestedPrompts).toEqual([
+        { summaryTitle: "Imported", prompt: "Use the imported prompt" },
+      ]);
+      expect(importedAgent.knowledgeBaseIds).toEqual([kb.id]);
+      expect(importedAgent.tools).toEqual([]);
+      expect(importedAgent.importWarnings).toContain(
+        "Tool assignments were not imported. Re-assign tools after import so normal tool visibility and permission checks apply.",
+      );
+    });
+  });
+
   describe("PUT /api/agents/:id", () => {
     test("should update an agent name", async ({ makeAgent }) => {
       const suffix = crypto.randomUUID().slice(0, 8);
