@@ -6,11 +6,11 @@ import {
   type archestraApiTypes,
   E2eTestId,
 } from "@shared";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ColumnDef, SortingState } from "@tanstack/react-table";
-import { ChevronDown, ChevronUp, Plus } from "lucide-react";
+import { ChevronDown, ChevronUp, Plus, Upload } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { type ChangeEvent, useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { ErrorBoundary } from "@/app/_parts/error-boundary";
 import { A2AConnectionInstructions } from "@/components/a2a-connection-instructions";
@@ -31,9 +31,11 @@ import { PageLayout } from "@/components/page-layout";
 import { PermissionRequirementHint } from "@/components/permission-requirement-hint";
 import { ResourceVisibilityBadge } from "@/components/resource-visibility-badge";
 import { SearchInput } from "@/components/search-input";
+import { StandardDialog } from "@/components/standard-dialog";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/ui/data-table";
 import { PermissionButton } from "@/components/ui/permission-button";
+import { Textarea } from "@/components/ui/textarea";
 import { DEFAULT_SORT_BY, DEFAULT_SORT_DIRECTION } from "@/consts";
 import {
   useDeleteProfile,
@@ -188,6 +190,7 @@ function Agents({ initialData }: { initialData?: AgentsInitialData }) {
   type AgentData = archestraApiTypes.GetAgentsResponses["200"]["data"][number];
 
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
+  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
   const [connectingAgent, setConnectingAgent] = useState<{
     id: string;
     name: string;
@@ -463,14 +466,24 @@ function Agents({ initialData }: { initialData?: AgentsInitialData }) {
           </p>
         }
         actionButton={
-          <PermissionButton
-            permissions={{ agent: ["create"] }}
-            onClick={() => setIsCreateDialogOpen(true)}
-            data-testid={E2eTestId.CreateAgentButton}
-          >
-            <Plus className="mr-2 h-4 w-4" />
-            Create Agent
-          </PermissionButton>
+          <div className="flex items-center gap-2">
+            <PermissionButton
+              permissions={{ agent: ["create"] }}
+              variant="outline"
+              onClick={() => setIsImportDialogOpen(true)}
+            >
+              <Upload className="mr-2 h-4 w-4" />
+              Import Agent
+            </PermissionButton>
+            <PermissionButton
+              permissions={{ agent: ["create"] }}
+              onClick={() => setIsCreateDialogOpen(true)}
+              data-testid={E2eTestId.CreateAgentButton}
+            >
+              <Plus className="mr-2 h-4 w-4" />
+              Create Agent
+            </PermissionButton>
+          </div>
         }
       >
         <div>
@@ -523,6 +536,11 @@ function Agents({ initialData }: { initialData?: AgentsInitialData }) {
               }}
             />
 
+            <ImportAgentDialog
+              open={isImportDialogOpen}
+              onOpenChange={setIsImportDialogOpen}
+            />
+
             {connectingAgent && (
               <ConnectAgentDialog
                 agent={connectingAgent}
@@ -557,6 +575,109 @@ function Agents({ initialData }: { initialData?: AgentsInitialData }) {
         </div>
       </PageLayout>
     </LoadingWrapper>
+  );
+}
+
+function ImportAgentDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [importJson, setImportJson] = useState("");
+
+  const importAgent = useMutation({
+    mutationFn: async (body: archestraApiTypes.ImportAgentData["body"]) => {
+      const { data, error } = await archestraApiSdk.importAgent({ body });
+      if (error || !data) {
+        throw new Error(error?.error?.message ?? "Failed to import agent");
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      const warnings = data.importWarnings ?? [];
+      if (warnings.length > 0) {
+        const warningLabel = warnings.length === 1 ? "warning" : "warnings";
+        toast.warning(
+          `Agent imported with ${warnings.length} ${warningLabel}`,
+          {
+            description: warnings.join("\n"),
+          },
+        );
+      } else {
+        toast.success(`Agent imported${data.name ? `: ${data.name}` : ""}`);
+      }
+      setImportJson("");
+      onOpenChange(false);
+    },
+    onError: (error) => {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to import agent",
+      );
+    },
+  });
+
+  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setImportJson(await file.text());
+  };
+
+  const handleImport = () => {
+    try {
+      importAgent.mutate(
+        JSON.parse(importJson) as archestraApiTypes.ImportAgentData["body"],
+      );
+    } catch {
+      toast.error("Import JSON is invalid");
+    }
+  };
+
+  return (
+    <StandardDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Import Agent"
+      description="Paste an exported agent JSON file or upload it from disk."
+      size="medium"
+      footer={
+        <>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={importAgent.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleImport}
+            disabled={!importJson.trim() || importAgent.isPending}
+          >
+            {importAgent.isPending ? "Importing..." : "Import Agent"}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <input
+          type="file"
+          accept="application/json,.json"
+          onChange={handleFileChange}
+          disabled={importAgent.isPending}
+          className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-muted file:px-3 file:py-2 file:text-sm file:font-medium file:text-foreground hover:file:bg-muted/80"
+        />
+        <Textarea
+          value={importJson}
+          onChange={(event) => setImportJson(event.target.value)}
+          placeholder="Paste exported agent JSON here"
+          disabled={importAgent.isPending}
+          className="min-h-64 font-mono text-xs"
+        />
+      </div>
+    </StandardDialog>
   );
 }
 
